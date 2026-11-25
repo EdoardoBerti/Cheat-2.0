@@ -1,0 +1,30 @@
+# Build directories
+build/
+bin/
+obj/
+x64/
+Debug/
+Release/
+
+# Visual Studio files
+.vs/
+*.user
+*.suo
+*.sln.docstates
+
+# Vendor (ImGui is cloned via setup.bat)
+vendor/imgui/
+
+# Compiled outputs
+*.exe
+*.sys
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Dumps & logs
+dump.cs
+script.json
+*.log
