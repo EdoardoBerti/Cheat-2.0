@@ -78,8 +78,31 @@ public:
         return false;
     }
 
+    static bool EnableDebugPrivilege() {
+        HANDLE hToken = NULL;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+            return false;
+
+        LUID luid = {};
+        if (!LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luid)) {
+            CloseHandle(hToken);
+            return false;
+        }
+
+        TOKEN_PRIVILEGES tp = {};
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        BOOL ok = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        CloseHandle(hToken);
+        return (ok && GetLastError() != ERROR_NOT_ALL_ASSIGNED);
+    }
+
     // Hybrid auto-loader: tries Kernel first, falls back to direct Usermode (standalone single .exe)
     bool EnsureDriverLoaded() {
+        EnableDebugPrivilege();
+
         // 1. Check if kernel driver is already running
         if (ConnectKernel()) {
             printf("[+] Kernel Driver rilevato ed attivo! (Stealth IOCTL Mode)\n");
@@ -151,7 +174,12 @@ public:
 
     // Wait for game process and all required modules
     bool WaitForGame() {
-        printf("[*] In attesa che ROB RUN.exe venga avviato... (Apri ora il gioco da Steam)\n");
+        if (mode == MODE_USERMODE) {
+            printf("[*] In attesa che ROB RUN.exe venga avviato...\n");
+            printf("[i] NOTA USERMODE: Se giochi offline/testing, avvia direttamente 'ROB RUN.exe' (senza EAC da Steam).\n");
+        } else {
+            printf("[*] In attesa che ROB RUN.exe venga avviato... (Apri ora il gioco da Steam)\n");
+        }
 
         while (!FindProcess(L"ROB RUN.exe")) {
             Sleep(500);
@@ -161,13 +189,48 @@ public:
         printf("[*] In attesa del caricamento dei moduli (GameAssembly.dll, UnityPlayer.dll)...\n");
         uint32_t game_size = 0;
         int attempts = 0;
-        while (!FindModule(L"GameAssembly.dll", ga_base, ga_size) ||
-               !FindModule(L"UnityPlayer.dll", unity_base, unity_size))
+        bool ga_ok = false;
+        bool unity_ok = false;
+
+        while (!ga_ok || !unity_ok)
         {
+            if (!ga_ok)
+                ga_ok = FindModule(L"GameAssembly.dll", ga_base, ga_size);
+            if (!unity_ok)
+                unity_ok = FindModule(L"UnityPlayer.dll", unity_base, unity_size);
+
+            if (ga_ok && unity_ok)
+                break;
+
             Sleep(1000);
             attempts++;
-            if (attempts > 90) {
+
+            if (attempts % 3 == 0) {
+                DWORD err = GetLastError();
+                printf("    [~] Attesa moduli... (%d/60) [GameAssembly: %s | UnityPlayer: %s]\n",
+                    attempts,
+                    ga_ok ? "OK" : "mancante",
+                    unity_ok ? "OK" : "mancante");
+
+                if (mode == MODE_USERMODE && (err == ERROR_ACCESS_DENIED || err == 5)) {
+                    printf("\n[!] ====================================================================\n");
+                    printf("[!] ACCESSO NEGATO (Errore 5 Win32):\n");
+                    printf("[!] EasyAntiCheat (EAC) e' attivo e blocca la scansione usermode!\n");
+                    printf("[!]\n");
+                    printf("[!] SOLUZIONE 1 (Usermode): Chiudi il gioco da Steam e avvia direttamente:\n");
+                    printf("[!]   -> 'ROB RUN.exe' dalla cartella del gioco (senza EAC).\n");
+                    printf("[!]\n");
+                    printf("[!] SOLUZIONE 2 (Online con EAC): Mappa il driver kernel con KDMapper:\n");
+                    printf("[!]   -> kdmapper.exe ronrun_driver.sys\n");
+                    printf("[!] ====================================================================\n\n");
+                }
+            }
+
+            if (attempts > 60) {
                 printf("[!] Timeout: moduli di gioco non caricati in tempo.\n");
+                if (mode == MODE_USERMODE) {
+                    printf("[!] Se il gioco e' stato avviato da Steam con EAC, avvia invece 'ROB RUN.exe' direttamente!\n");
+                }
                 return false;
             }
         }
@@ -235,6 +298,12 @@ public:
                     FALSE, pid
                 );
             }
+            if (!hProcess) {
+                hProcess = OpenProcess(
+                    PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+                    FALSE, pid
+                );
+            }
             return (hProcess != NULL && hProcess != INVALID_HANDLE_VALUE);
         }
 
@@ -262,28 +331,53 @@ public:
             return false;
         }
 
-        // Usermode direct lookup via Toolhelp32 Snapshot
+        // Usermode direct lookup
         if (!pid) return false;
 
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-        if (snap == INVALID_HANDLE_VALUE) return false;
-
-        MODULEENTRY32W me = {};
-        me.dwSize = sizeof(me);
-
-        bool found = false;
-        if (Module32FirstW(snap, &me)) {
-            do {
-                if (_wcsicmp(me.szModule, name) == 0) {
-                    base = reinterpret_cast<uint64_t>(me.modBaseAddr);
-                    size = me.modBaseSize;
-                    found = true;
-                    break;
+        // Method 1: PSAPI EnumProcessModulesEx (most reliable for 64-bit processes)
+        if (hProcess && hProcess != INVALID_HANDLE_VALUE) {
+            HMODULE hMods[1024] = {};
+            DWORD cbNeeded = 0;
+            if (EnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_ALL)) {
+                DWORD count = cbNeeded / sizeof(HMODULE);
+                for (DWORD i = 0; i < count; i++) {
+                    wchar_t modName[MAX_PATH] = {};
+                    if (GetModuleBaseNameW(hProcess, hMods[i], modName, MAX_PATH)) {
+                        if (_wcsicmp(modName, name) == 0) {
+                            MODULEINFO mi = {};
+                            if (GetModuleInformation(hProcess, hMods[i], &mi, sizeof(mi))) {
+                                base = reinterpret_cast<uint64_t>(mi.lpBaseOfDll);
+                                size = mi.SizeOfImage;
+                                return true;
+                            }
+                        }
+                    }
                 }
-            } while (Module32NextW(snap, &me));
+            }
         }
-        CloseHandle(snap);
-        return found;
+
+        // Method 2: Toolhelp32 Snapshot (standard 64-bit)
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+        if (snap == INVALID_HANDLE_VALUE) {
+            snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        }
+        if (snap != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32W me = {};
+            me.dwSize = sizeof(me);
+            if (Module32FirstW(snap, &me)) {
+                do {
+                    if (_wcsicmp(me.szModule, name) == 0) {
+                        base = reinterpret_cast<uint64_t>(me.modBaseAddr);
+                        size = me.modBaseSize;
+                        CloseHandle(snap);
+                        return true;
+                    }
+                } while (Module32NextW(snap, &me));
+            }
+            CloseHandle(snap);
+        }
+
+        return false;
     }
 
     // ---- Memory Read ----
