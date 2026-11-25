@@ -5,7 +5,7 @@
 // ============================================================================
 
 #include "offsets.h"
-#include "math.h"
+#include "cheat_math.h"
 #include "driver_comm.h"
 #include <string>
 #include <vector>

@@ -8,5 +8,5 @@
 #include <cstdint>
 #include <cstddef>
 
-inline const uint8_t g_driver_payload[] = {};
+inline const uint8_t g_driver_payload[] = { 0 };
 inline const size_t g_driver_payload_size = 0;

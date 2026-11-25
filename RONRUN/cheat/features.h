@@ -4,7 +4,7 @@
 // ============================================================================
 
 #include "sdk.h"
-#include "math.h"
+#include "cheat_math.h"
 #include <vector>
 #include <algorithm>
 #include <cstdint>
